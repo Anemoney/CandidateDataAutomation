@@ -35,4 +35,4 @@ COPY . .
 EXPOSE 8000
 
 # Run the Streamlit app, listening on Cloud Run's dynamic port
-CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8000} --server.address=0.0.0.0"]
+CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8080} --server.address=0.0.0.0"]
