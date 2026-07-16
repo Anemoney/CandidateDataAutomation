@@ -1,0 +1,8 @@
+streamlit>=1.36.0
+playwright>=1.44.0
+google-genai
+beautifulsoup4
+lxml
+nest-asyncio
+pydantic
+supabase
