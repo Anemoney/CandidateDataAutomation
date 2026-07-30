@@ -94,7 +94,7 @@ CRITICAL RULES:
 """
 
 # ── RUN PROCESS ──
-def categorize_candidate(candidate_data: dict, log_func) -> dict:
+def categorize_candidate(candidate_data: dict, log_func, api_key: str) -> dict: # <--- Added api_key parameter
     client = genai.Client(api_key=api_key)
     
     bp_url = candidate_data['metadata'].get('ballotpedia_url', 'Unknown Source')
