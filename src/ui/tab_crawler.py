@@ -111,61 +111,73 @@ def render():
             st.session_state.crawler_logs.append(msg)
             st.write(msg) # Outputs inside the status container during the run
 
+        # Tracks successful saves across the run. A plain int can't be
+        # rebound from inside the nested callback below without `nonlocal`.
+        success_count = 0
+
+        def on_candidate_scraped(record):
+            """
+            Called immediately after each candidate is scraped (before the
+            next one starts). Categorizes and upserts right away so a
+            candidate's full scraped text never has to sit around waiting
+            for the rest of the batch to finish -- keeping peak memory to
+            roughly "one candidate" instead of "the whole state."
+            """
+            nonlocal success_count
+            ui_logger(f"    ↳ Categorizing: {record['metadata']['name']}")
+
+            structured_content = categorize_candidate(
+                candidate_data=record,
+                log_func=ui_logger,
+                api_key=user_api_key
+            )
+
+            # --- PRESERVE QA STATE ---
+            qa_status = "Pending"
+            qa_notes = ""
+
+            # Check if this candidate already exists in Supabase
+            existing = supabase.table("candidates").select("qa_status, qa_notes")\
+                .eq("name", record['metadata']['name'])\
+                .eq("office", record['metadata']['office'])\
+                .eq("state", state)\
+                .eq("election_year", int(year)).execute()
+
+            # If they exist, carry over their previous QA work
+            if existing.data:
+                qa_status = existing.data[0].get("qa_status", "Pending")
+                qa_notes = existing.data[0].get("qa_notes", "")
+            # -------------------------
+
+            db_payload = {
+                "name": record['metadata']['name'],
+                "office": record['metadata']['office'],
+                "state": state,
+                "election_year": int(year),
+                "party": record['metadata'].get('party', 'Unknown'),
+                "metadata": record['metadata'],
+                "structured_content": structured_content,
+                "qa_status": qa_status,  # Uses the preserved state
+                "qa_notes": qa_notes     # Uses the preserved notes
+            }
+
+            try:
+                supabase.table("candidates").upsert(db_payload, on_conflict="name, office, state, election_year").execute()
+                success_count += 1
+            except Exception as e:
+                ui_logger(f"    ❌ Database error for {record['metadata']['name']}: {e}")
+
         with st.status(f"Executing Scraper Pipeline for {state}...", expanded=True) as status:
-            scraped_data = run_scraper(
+            st.write("🤖 Scraping, categorizing with Gemini, and saving each candidate as it completes...")
+            run_scraper(
                 state=state, 
                 year=year, 
                 target_parties=target_parties, 
                 include_tables=include_tables, 
-                log_func=ui_logger
+                log_func=ui_logger,
+                on_candidate_scraped=on_candidate_scraped
             )
-            
-            st.write("🤖 Phase 4: Categorizing with Gemini & Saving to Database...")
-            success_count = 0
-            for record in scraped_data:
-                ui_logger(f"    ↳ Categorizing: {record['metadata']['name']}")
-                
-                structured_content = categorize_candidate(
-                    candidate_data=record, 
-                    log_func=ui_logger, 
-                    api_key=user_api_key
-                )
-                
-                # --- NEW LOGIC: PRESERVE QA STATE ---
-                qa_status = "Pending"
-                qa_notes = ""
-                
-                # Check if this candidate already exists in Supabase
-                existing = supabase.table("candidates").select("qa_status, qa_notes")\
-                    .eq("name", record['metadata']['name'])\
-                    .eq("office", record['metadata']['office'])\
-                    .eq("state", state)\
-                    .eq("election_year", int(year)).execute()
-                
-                # If they exist, carry over their previous QA work
-                if existing.data:
-                    qa_status = existing.data[0].get("qa_status", "Pending")
-                    qa_notes = existing.data[0].get("qa_notes", "")
-                # ------------------------------------
 
-                db_payload = {
-                    "name": record['metadata']['name'],
-                    "office": record['metadata']['office'],
-                    "state": state,
-                    "election_year": int(year),
-                    "party": record['metadata'].get('party', 'Unknown'),
-                    "metadata": record['metadata'],
-                    "structured_content": structured_content,
-                    "qa_status": qa_status,  # Uses the preserved state
-                    "qa_notes": qa_notes     # Uses the preserved notes
-                }
-                
-                try:
-                    supabase.table("candidates").upsert(db_payload, on_conflict="name, office, state, election_year").execute()
-                    success_count += 1
-                except Exception as e:
-                    ui_logger(f"    ❌ Database error for {record['metadata']['name']}: {e}")
-            
             status.update(label=f"✅ Pipeline Complete! Saved {success_count} candidates.", state="complete", expanded=False)
             
         st.success("Data successfully pushed to Supabase! Switch to the QA Dashboard to review.")
