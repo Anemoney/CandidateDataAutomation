@@ -11,7 +11,7 @@ import streamlit as st
 # ── RATE LIMITER METRONOME ──
 class LocalRateLimiter:
     """Tracks RPM and TPM, enforcing a steady metronome pace."""
-    def __init__(self, max_rpm=14, max_tpm=200000):
+    def __init__(self, max_rpm=12, max_tpm=200000):
         self.max_rpm = max_rpm
         self.max_tpm = max_tpm
         self.request_timestamps = deque()
