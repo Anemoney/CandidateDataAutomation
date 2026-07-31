@@ -18,6 +18,12 @@ BLOCKED_PATH_KEYWORDS = {
 }
 BLOCKED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".svg"}
 
+# Caps the number of internal sub-pages scraped per campaign site. Some sites
+# have dozens/hundreds of internal links; without a cap, a single sprawling
+# site can spike memory for the whole batch. Tune based on how deep you
+# actually need to go for useful campaign content.
+MAX_SUBPAGES_PER_SITE = 15
+
 # --- EMAIL/CONTACT RESOLUTION HEURISTICS ---
 def resolve_primary_contacts(emails, phones, addresses, candidate_name, website_url=""):
     """Applies heuristics to select the single best contact option and drops the rest."""
@@ -268,14 +274,24 @@ async def fetch_page_html(page, url, log_func, custom_timeout=45000):
             return None, str(e)
 
 # --- MASTER HARVEST FLOW ---
-async def async_harvest_pipeline(state: str, year: str, target_parties: list, include_tables: list, log_func):
+async def async_harvest_pipeline(state: str, year: str, target_parties: list, include_tables: list, log_func, on_candidate_scraped=None):
+    """
+    Runs the scrape. Rather than accumulating every candidate's full record
+    in memory and returning the whole batch at the end, this calls
+    on_candidate_scraped(record) as soon as each candidate is done, so the
+    caller can categorize/persist and let it be garbage collected immediately.
+    Returns the number of candidates processed.
+    """
     STATE_URL = state.replace(' ', '_')
     START_URL = f"https://ballotpedia.org/{STATE_URL}_elections,_{year}"
-    scraped_data = []
+    processed_count = 0
 
     async with async_playwright() as p:
         log_func("Booting headless Chromium...")
-        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled", "--disable-dev-shm-usage"]
+        )
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -287,7 +303,7 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
         if not main_html:
             log_func("❌ Critical Failure: Main page blocked. Check config fields.")
             await browser.close()
-            return []
+            return processed_count
 
         await page.wait_for_timeout(3000)
         main_html = await page.content()
@@ -386,10 +402,14 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
                     site_pages = [{"url": active_url, "text": home_text}]
 
                     if not is_gov_site:
-                        internal_links = get_internal_links(site_html, active_url)
-                        log_func(f"    -> Found {len(internal_links)} sub-links. Scraping all...")
+                        internal_links = sorted(get_internal_links(site_html, active_url))
+                        if len(internal_links) > MAX_SUBPAGES_PER_SITE:
+                            log_func(f"    -> Found {len(internal_links)} sub-links. Capping at {MAX_SUBPAGES_PER_SITE} to control memory.")
+                            internal_links = internal_links[:MAX_SUBPAGES_PER_SITE]
+                        else:
+                            log_func(f"    -> Found {len(internal_links)} sub-links. Scraping all...")
 
-                        for sub_link in sorted(list(internal_links)):
+                        for sub_link in internal_links:
                             sub_html, final_sub_url = await fetch_page_html(page, sub_link, log_func)
                             final_domain = urlparse(final_sub_url).netloc
                             if any(blocked in final_domain for blocked in BLOCKED_DOMAINS):
@@ -417,13 +437,29 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
                 website_url=site_url
             )
             candidate_record["metadata"]["extracted_contacts"] = resolved
-            scraped_data.append(candidate_record)
+
+            if on_candidate_scraped:
+                on_candidate_scraped(candidate_record)
+            processed_count += 1
+            # candidate_record (and its full site text) falls out of scope
+            # here and can be garbage collected, instead of living on in a
+            # growing batch list for the rest of the run.
 
             await page.wait_for_timeout(2000)
 
         await browser.close()
-        return scraped_data
+        return processed_count
 
-def run_scraper(state: str, year: str, target_parties: list, include_tables: list, log_func):
-    """Synchronous wrapper to call from Streamlit."""
-    return asyncio.run(async_harvest_pipeline(state, year, target_parties, include_tables, log_func))
+def run_scraper(state: str, year: str, target_parties: list, include_tables: list, log_func, on_candidate_scraped=None):
+    """
+    Synchronous wrapper to call from Streamlit.
+
+    on_candidate_scraped, if provided, is called synchronously with each
+    candidate_record as soon as it's scraped, letting the caller categorize
+    and persist it right away instead of waiting for the whole batch.
+    Returns the number of candidates processed.
+    """
+    return asyncio.run(async_harvest_pipeline(
+        state, year, target_parties, include_tables, log_func,
+        on_candidate_scraped=on_candidate_scraped
+    ))
