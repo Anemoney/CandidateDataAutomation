@@ -106,6 +106,25 @@ def render():
 
         supabase = init_connection()
 
+        # --- RESUME SUPPORT ---
+        # Pull every (name, office) already saved for this state/year in one
+        # query, so a second "Start Harvest" click can skip candidates that
+        # were already scraped+saved in a prior run that got cut off, instead
+        # of re-scraping the whole state from the top. Also lets us keep
+        # carrying forward each candidate's QA status/notes as before.
+        existing_rows = supabase.table("candidates").select("name, office, qa_status, qa_notes")\
+            .eq("state", state)\
+            .eq("election_year", int(year)).execute()
+
+        existing_lookup = {
+            (row["name"], row["office"]): row
+            for row in (existing_rows.data or [])
+        }
+
+        def is_already_processed(cand):
+            return (cand['name'], cand['office']) in existing_lookup
+        # -----------------------
+
         # Define a custom logging function that updates both the UI and the persistent state
         def ui_logger(msg):
             st.session_state.crawler_logs.append(msg)
@@ -121,7 +140,8 @@ def render():
             next one starts). Categorizes and upserts right away so a
             candidate's full scraped text never has to sit around waiting
             for the rest of the batch to finish -- keeping peak memory to
-            roughly "one candidate" instead of "the whole state."
+            roughly "one candidate" instead of "the whole state," and
+            ensuring progress is saved even if the run gets cut off later.
             """
             nonlocal success_count
             ui_logger(f"    ↳ Categorizing: {record['metadata']['name']}")
@@ -133,20 +153,10 @@ def render():
             )
 
             # --- PRESERVE QA STATE ---
-            qa_status = "Pending"
-            qa_notes = ""
-
-            # Check if this candidate already exists in Supabase
-            existing = supabase.table("candidates").select("qa_status, qa_notes")\
-                .eq("name", record['metadata']['name'])\
-                .eq("office", record['metadata']['office'])\
-                .eq("state", state)\
-                .eq("election_year", int(year)).execute()
-
-            # If they exist, carry over their previous QA work
-            if existing.data:
-                qa_status = existing.data[0].get("qa_status", "Pending")
-                qa_notes = existing.data[0].get("qa_notes", "")
+            # Reuse the upfront lookup instead of an extra per-candidate query
+            existing = existing_lookup.get((record['metadata']['name'], record['metadata']['office']))
+            qa_status = existing.get("qa_status", "Pending") if existing else "Pending"
+            qa_notes = existing.get("qa_notes", "") if existing else ""
             # -------------------------
 
             db_payload = {
@@ -175,10 +185,11 @@ def render():
                 target_parties=target_parties, 
                 include_tables=include_tables, 
                 log_func=ui_logger,
-                on_candidate_scraped=on_candidate_scraped
+                on_candidate_scraped=on_candidate_scraped,
+                is_already_processed=is_already_processed,
             )
 
-            status.update(label=f"✅ Pipeline Complete! Saved {success_count} candidates.", state="complete", expanded=False)
+            status.update(label=f"✅ Pipeline Complete! Saved {success_count} candidates this run.", state="complete", expanded=False)
             
         st.success("Data successfully pushed to Supabase! Switch to the QA Dashboard to review.")
 
