@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -20,9 +21,15 @@ BLOCKED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".zip", ".png", ".jpg", ".jpeg",
 
 # Caps the number of internal sub-pages scraped per campaign site. Some sites
 # have dozens/hundreds of internal links; without a cap, a single sprawling
-# site can spike memory for the whole batch. Tune based on how deep you
-# actually need to go for useful campaign content.
+# site can spike memory and time for the whole batch.
 MAX_SUBPAGES_PER_SITE = 15
+
+# Cloud Run's request timeout has a hard ceiling of 3600s (60 min) -- it
+# cannot be configured higher. This budget makes the pipeline stop itself
+# gracefully with time to spare, rather than getting killed mid-candidate
+# with no chance to log anything. Leaves ~10 min of buffer for browser
+# startup/shutdown and in-flight Gemini/DB calls to finish.
+TIME_BUDGET_SECONDS = 3000
 
 # --- EMAIL/CONTACT RESOLUTION HEURISTICS ---
 def resolve_primary_contacts(emails, phones, addresses, candidate_name, website_url=""):
@@ -274,17 +281,35 @@ async def fetch_page_html(page, url, log_func, custom_timeout=45000):
             return None, str(e)
 
 # --- MASTER HARVEST FLOW ---
-async def async_harvest_pipeline(state: str, year: str, target_parties: list, include_tables: list, log_func, on_candidate_scraped=None):
+async def async_harvest_pipeline(
+    state: str,
+    year: str,
+    target_parties: list,
+    include_tables: list,
+    log_func,
+    on_candidate_scraped=None,
+    is_already_processed=None,
+):
     """
-    Runs the scrape. Rather than accumulating every candidate's full record
-    in memory and returning the whole batch at the end, this calls
-    on_candidate_scraped(record) as soon as each candidate is done, so the
-    caller can categorize/persist and let it be garbage collected immediately.
-    Returns the number of candidates processed.
+    Runs the scrape.
+
+    on_candidate_scraped(record), if provided, is called as soon as each
+    candidate is done -- so the caller can categorize/persist immediately
+    instead of holding the whole batch in memory.
+
+    is_already_processed(cand), if provided, is called before doing the
+    expensive per-candidate work (site fetch + sub-page crawl). If it
+    returns True, that candidate is skipped entirely -- this is what lets a
+    second "Start Harvest" click resume a batch that got cut off, instead
+    of re-scraping everyone from scratch.
+
+    Returns the number of candidates newly processed (skipped candidates
+    don't count).
     """
     STATE_URL = state.replace(' ', '_')
     START_URL = f"https://ballotpedia.org/{STATE_URL}_elections,_{year}"
     processed_count = 0
+    pipeline_start = time.monotonic()
 
     async with async_playwright() as p:
         log_func("Booting headless Chromium...")
@@ -352,6 +377,19 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
 
         # Deep Extraction Loop
         for count, cand in enumerate(harvested_roster, start=1):
+            elapsed = time.monotonic() - pipeline_start
+            if elapsed > TIME_BUDGET_SECONDS:
+                log_func(
+                    f"\n⏱️ Time budget reached ({elapsed:.0f}s). Stopping gracefully with "
+                    f"{len(harvested_roster) - count + 1} candidate(s) remaining. "
+                    f"Click Start Harvest again to resume the rest of this batch."
+                )
+                break
+
+            if is_already_processed and is_already_processed(cand):
+                log_func(f"\n[{count}/{len(harvested_roster)}] ⏭️ Skipping (already saved): {cand['name']}")
+                continue
+
             log_func(f"\n[{count}/{len(harvested_roster)}] Processing Profile: {cand['name']}")
             
             bp_html, _ = await fetch_page_html(page, cand['bp_url'], log_func)
@@ -404,7 +442,7 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
                     if not is_gov_site:
                         internal_links = sorted(get_internal_links(site_html, active_url))
                         if len(internal_links) > MAX_SUBPAGES_PER_SITE:
-                            log_func(f"    -> Found {len(internal_links)} sub-links. Capping at {MAX_SUBPAGES_PER_SITE} to control memory.")
+                            log_func(f"    -> Found {len(internal_links)} sub-links. Capping at {MAX_SUBPAGES_PER_SITE} to control memory/time.")
                             internal_links = internal_links[:MAX_SUBPAGES_PER_SITE]
                         else:
                             log_func(f"    -> Found {len(internal_links)} sub-links. Scraping all...")
@@ -450,16 +488,22 @@ async def async_harvest_pipeline(state: str, year: str, target_parties: list, in
         await browser.close()
         return processed_count
 
-def run_scraper(state: str, year: str, target_parties: list, include_tables: list, log_func, on_candidate_scraped=None):
+def run_scraper(
+    state: str,
+    year: str,
+    target_parties: list,
+    include_tables: list,
+    log_func,
+    on_candidate_scraped=None,
+    is_already_processed=None,
+):
     """
-    Synchronous wrapper to call from Streamlit.
-
-    on_candidate_scraped, if provided, is called synchronously with each
-    candidate_record as soon as it's scraped, letting the caller categorize
-    and persist it right away instead of waiting for the whole batch.
-    Returns the number of candidates processed.
+    Synchronous wrapper to call from Streamlit. See async_harvest_pipeline
+    for what on_candidate_scraped and is_already_processed do.
+    Returns the number of candidates newly processed.
     """
     return asyncio.run(async_harvest_pipeline(
         state, year, target_parties, include_tables, log_func,
-        on_candidate_scraped=on_candidate_scraped
+        on_candidate_scraped=on_candidate_scraped,
+        is_already_processed=is_already_processed,
     ))
