@@ -113,8 +113,8 @@ def render():
                     if cat_data:
                         st.markdown(f"<h3 style='color: #2563eb; margin: 5px 0px; font-size: 1.1rem;'>🔍 {cat}</h3>", unsafe_allow_html=True)
                         
-                        edit_text = st.text_area(f"Verbatim Extraction ({cat})", label_visibility="collapsed", value=cat_data.get("text", ""), height=100, key=f"text_{cat}")
-                        edit_url = st.text_input(f"Source URL ({cat})", label_visibility="collapsed", value=cat_data.get("source_url", ""), key=f"url_{cat}")
+                        edit_text = st.text_area(f"Verbatim Extraction ({cat})", label_visibility="collapsed", value=cat_data.get("text", ""), height=100, key=f"text_{candidate['id']}_{cat}")
+                        edit_url = st.text_input(f"Source URL ({cat})", label_visibility="collapsed", value=cat_data.get("source_url", ""), key=f"url_{candidate['id']}_{cat}")
                         
                         edit_content[cat] = {"text": edit_text, "source_url": edit_url}
                         st.markdown("<hr style='margin: 10px 0; border: 0; border-top: 1px dashed #cbd5e1;'>", unsafe_allow_html=True)
