@@ -97,6 +97,10 @@ def render():
                 edit_website = st.text_input("Campaign Website", value=socials.get("campaign_website", ""))
                 edit_fb = st.text_input("Facebook", value=socials.get("facebook", ""))
                 edit_x = st.text_input("X (Twitter)", value=socials.get("x", ""))
+                edit_instagram = st.text_input("Instagram", value=socials.get("instagram", ""))
+                edit_linkedin = st.text_input("LinkedIn", value=socials.get("linkedin", ""))
+                edit_youtube = st.text_input("YouTube", value=socials.get("youtube", ""))
+                edit_tiktok = st.text_input("TikTok", value=socials.get("tiktok", ""))
                 
                 st.markdown("<h2 style='color: #1e3a8a; border-bottom: 2px solid #e2e8f0; padding-bottom: 4px; margin-top: 15px; margin-bottom: 10px; font-size: 1.5rem;'>📝 Structured Content</h2>", unsafe_allow_html=True)
                 
@@ -139,9 +143,18 @@ def render():
         if mark_reviewed or flag_issue or save_draft:
             new_status = "Reviewed" if mark_reviewed else "Flagged" if flag_issue else "Pending"
             
-            meta["extracted_contacts"] = {"email": edit_email, "phone": edit_phone, "address": edit_address}
+            meta["extracted_contacts"] = {**contacts, "email": edit_email, "phone": edit_phone, "address": edit_address}
             meta["ballotpedia_url"] = edit_bp
-            meta["socials"] = {"campaign_website": edit_website, "facebook": edit_fb, "x": edit_x} 
+            meta["socials"] = {
+                **socials,
+                "campaign_website": edit_website,
+                "facebook": edit_fb,
+                "x": edit_x,
+                "instagram": edit_instagram,
+                "linkedin": edit_linkedin,
+                "youtube": edit_youtube,
+                "tiktok": edit_tiktok,
+            }
             
             for cat, data in edit_content.items():
                 content[cat] = data
