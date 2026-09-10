@@ -11,7 +11,7 @@ import streamlit as st
 # ── RATE LIMITER METRONOME ──
 class LocalRateLimiter:
     """Tracks RPM and TPM, enforcing a steady metronome pace."""
-    def __init__(self, max_rpm=12, max_tpm=200000):
+    def __init__(self, max_rpm=14, max_tpm=200000):
         self.max_rpm = max_rpm
         self.max_tpm = max_tpm
         self.request_timestamps = deque()
@@ -19,7 +19,7 @@ class LocalRateLimiter:
         self.min_gap_seconds = 60.0 / self.max_rpm
         self.last_request_time = 0
 
-    def wait_if_needed(self, estimated_tokens, log_func):
+    def wait_if_needed(self, estimated_tokens, log_func, max_throttle_rounds=10):
         now = time.time()
         time_since_last = now - self.last_request_time
         if time_since_last < self.min_gap_seconds:
@@ -28,17 +28,43 @@ class LocalRateLimiter:
             time.sleep(sleep_time)
             now = time.time()
 
-        while self.request_timestamps and now - self.request_timestamps[0] > 60:
-            self.request_timestamps.popleft()
-        while self.token_timestamps and now - self.token_timestamps[0][0] > 60:
-            self.token_timestamps.popleft()
+        # A single payload larger than the entire per-minute budget can never
+        # fit, no matter how long we wait. Waiting on it would loop forever,
+        # so clamp it and let the API be the judge instead of hanging here.
+        if estimated_tokens >= self.max_tpm:
+            log_func(
+                f"    ⚠️ Estimated payload ({estimated_tokens:,} tokens) meets or exceeds the "
+                f"{self.max_tpm:,} TPM budget on its own. Proceeding without waiting -- the "
+                f"request may be rejected for size."
+            )
+            estimated_tokens = self.max_tpm - 1
 
-        current_tpm = sum(count for _, count in self.token_timestamps)
-        if current_tpm + estimated_tokens > self.max_tpm:
-            log_func(f"    🚦 TPM limit risk ({current_tpm:,}). Throttling 30s...")
+        # Bounded retry rather than recursion: if the window still hasn't
+        # cleared after this many rounds, proceed and let the API respond
+        # rather than stalling the whole pipeline indefinitely.
+        for attempt in range(max_throttle_rounds):
+            now = time.time()
+            while self.request_timestamps and now - self.request_timestamps[0] > 60:
+                self.request_timestamps.popleft()
+            while self.token_timestamps and now - self.token_timestamps[0][0] > 60:
+                self.token_timestamps.popleft()
+
+            current_tpm = sum(count for _, count in self.token_timestamps)
+            if current_tpm + estimated_tokens <= self.max_tpm:
+                break
+
+            log_func(
+                f"    🚦 TPM limit risk ({current_tpm:,}). Throttling 30s "
+                f"[{attempt + 1}/{max_throttle_rounds}]..."
+            )
             time.sleep(30)
-            return self.wait_if_needed(estimated_tokens, log_func)
+        else:
+            log_func(
+                f"    ⚠️ TPM window did not clear after {max_throttle_rounds} rounds. "
+                f"Proceeding anyway."
+            )
 
+        now = time.time()
         self.request_timestamps.append(now)
         self.token_timestamps.append([now, estimated_tokens])
         self.last_request_time = now
