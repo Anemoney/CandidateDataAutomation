@@ -74,7 +74,9 @@ rate_limiter = LocalRateLimiter(max_rpm=14, max_tpm=200000)
 
 # ── STRUCTURING SCHEMAS ──
 class ContentBlock(BaseModel):
-    text: str = Field(description="The VERBATIM extracted passage from the source text. Do not paraphrase or summarize.")
+    text: str = Field(description="The VERBATIM extracted passage(s) from the source text. Do not paraphrase or summarize. "
+                                  "If drawing on more than one passage from the same page, join them with ' [...] ' "
+                                  "in the order they appear, so omitted material is visible.")
     source_url: Optional[str] = Field(default="Unknown Source", description="The exact URL of the specific page this text came from.")
 
 class CandidateCategories(BaseModel):
@@ -152,14 +154,14 @@ def extract_array_text(data_array):
         return " ".join([item.get("text", "") for item in data_array if isinstance(item, dict)])
     return str(data_array)
 
-# Hard ceiling on response length. Twelve categories at the ~150-word limit
-# in the system instruction lands around 3k tokens, so this is comfortable
-# headroom while still bounding a runaway response. Kept out of the TPM
-# estimate below on purpose: budgeting the full ceiling for every request
-# would trigger constant throttling for output that never actually arrives.
+# Hard ceiling on response length. Twelve categories at the ~300-word limit
+# in the system instruction is roughly 5k tokens including JSON overhead, so
+# this still leaves headroom while bounding a runaway response. Kept out of
+# the TPM estimate below on purpose: budgeting the full ceiling for every
+# request would trigger constant throttling for output that never arrives.
 MAX_OUTPUT_TOKENS = 8192
 
-def get_estimated_total_tokens(prompt_payload: str, expected_output_tokens: int = 2500) -> int:
+def get_estimated_total_tokens(prompt_payload: str, expected_output_tokens: int = 3500) -> int:
     return int(len(prompt_payload) / 2.5) + expected_output_tokens
 
 # ── SYSTEM PROMPTS ──
@@ -167,14 +169,20 @@ SYSTEM_INSTRUCTION = """
 You are a political data classification engineer. Your job is to extract verbatim text passages from the provided candidate sources and classify them into the correct categories.
 
 CRITICAL RULES:
-1. Verbatim Extraction Only: Copy exact word-for-word text from the source. Never summarize, paraphrase, or alter the original text.
+1. Verbatim Extraction Only: Copy exact word-for-word text from the source. Never summarize, paraphrase, reword, or fix the original text.
+1a. Multiple Excerpts Are Allowed: A category's relevant material is often spread across several places in a page rather than sitting in one block. You may combine two or more separate passages into one extraction, subject to these constraints:
+   - Join them with " [...] " so it is obvious that material was omitted between them.
+   - Keep excerpts in the SAME ORDER they appear in the source. Never reorder.
+   - Never use " [...] " at the very start or very end of the extraction; it marks omissions BETWEEN passages, not trimmed edges.
+   - Never let the join create a claim the candidate did not make. If a later passage qualifies, limits, or contradicts an earlier one, you must include the qualifying text too. Dropping a qualifier to make a position look cleaner is a serious error.
+   - Each excerpt must still be word-for-word exact. Combining passages does not license editing them.
 2. The "Null" Rule: If the provided text does not contain relevant information for a specific category, you MUST leave that category null/empty. Do not force-fit text. Most candidates will legitimately have several empty categories; that is the expected outcome, not a failure.
-3. Single Source per Category: Identify the single best source page for a category and pull the relevant content from it. Do not stitch together quotes from different URLs into the same category block.
+3. Single Source per Category: All excerpts for a given category must come from the SAME source block (the same URL). Within that one source you may draw from as many separate passages as the category warrants, per rule 1a. Never combine text from two different URLs into one category block -- if the best material is split across pages, choose the page with the strongest content.
 4. Sourcing: Each "=== SOURCE: [URL] ===" header applies to all text beneath it until the next "=== SOURCE:" header or "=== END OF SOURCES ===". Determine which block your extracted text came from and use that block's exact URL as the `source_url`. Never use a URL from a different block.
 5. Mutual Exclusivity: Each passage belongs to exactly one category. Do not place the same quote in multiple categories. Pick the best fit using the category descriptions in the schema.
 6. Subject Must Be The Candidate: Extract only text describing the candidate named in the prompt. Campaign sites frequently contain text about other people -- endorsers, opponents, running mates, staff, family members with their own biographies, and quoted supporters. Do not attribute any of that to the candidate.
 7. Ignore Boilerplate: Skip navigation labels, fundraising and donation appeals, newsletter signup text, volunteer forms, event listings, merchandise, legal disclaimers, and "Paid for by" committee notices. None of it belongs in any category.
-8. Length Discipline: Extract the most relevant passage for each category, up to roughly 150 words. If a category's relevant material is longer, choose the single most representative passage rather than reproducing the entire page. Staying within this limit matters -- an over-long response gets truncated and the entire result is discarded.
+8. Length and Substance: Aim for up to roughly 300 words per category -- about two paragraphs. Prefer completeness over brevity within that budget: if a candidate has developed views on an issue, capture them substantively rather than clipping to a single sentence. But spend the budget on substance, not volume. Skip transitional filler, marketing slogans, repeated taglines, and calls to action, and use the space for the passages that actually state the candidate's position, history, or reasoning. If genuinely relevant material still exceeds the budget, keep the most substantive passages rather than reproducing the whole page.
 """
 
 # ── RUN PROCESS ──
