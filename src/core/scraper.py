@@ -16,20 +16,40 @@ BLOCKED_PATH_KEYWORDS = {
     "privacy", "privacy-policy", "terms", "accessibility", "accessibility-statement", 
     "donate", "donation", "jobs", "cart", "login", "sign-in", "sign-up", 
     "authentication", "create-account", "legal", "disclaimer", "terms-and-conditions",
+    # Archive/listing pages. These are just excerpts of pages crawled elsewhere,
+    # so they add bulk without adding information -- and they're the main reason
+    # a site's text can balloon. Matching is per whole path segment, so these
+    # block "/page/2/" without touching "/homepage".
+    "page", "tag", "tags", "category", "categories", "archive", "archives",
+    "author", "feed", "rss", "atom", "search", "print", "amp",
+    "comment", "comments", "attachment", "trackback", "wp-json", "embed",
 }
+# A path segment that is exactly a year (e.g. "/2024/05/some-post") is
+# essentially always a blog date archive rather than candidate content.
+YEAR_SEGMENT_RE = re.compile(r"^(19|20)\d{2}$")
 BLOCKED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".zip", ".png", ".jpg", ".jpeg", ".gif", ".svg"}
 
-# Caps the number of internal sub-pages scraped per campaign site. Some sites
-# have dozens/hundreds of internal links; without a cap, a single sprawling
-# site can spike memory and time for the whole batch.
-MAX_SUBPAGES_PER_SITE = 15
+# A healthy campaign site yields roughly 30-60k chars of text. This is set
+# at 3-5x that, so it should never trip on a normal crawl -- if it does, it
+# means the crawler pulled in something it shouldn't have, and that gets
+# recorded in the candidate's metadata as a warning rather than silently
+# trimmed. (150k chars / 2.5 = ~60k est. tokens, well under the 200k TPM cap.)
+MAX_TOTAL_TEXT_CHARS = 150_000
 
 # Cloud Run's request timeout has a hard ceiling of 3600s (60 min) -- it
-# cannot be configured higher. This budget makes the pipeline stop itself
-# gracefully with time to spare, rather than getting killed mid-candidate
-# with no chance to log anything. Leaves ~10 min of buffer for browser
-# startup/shutdown and in-flight Gemini/DB calls to finish.
-TIME_BUDGET_SECONDS = 3000
+# cannot be configured higher, and hitting it is a SIGKILL with no chance to
+# log anything. Rather than guessing a single fixed budget, the loop stops
+# when the time left is less than the longest candidate it has actually seen
+# so far this run (never less than MIN_HEADROOM_SECONDS). That way a state
+# full of fast candidates uses nearly the whole window, while one full of
+# slow ones bails out early instead of getting cut off mid-write.
+HARD_DEADLINE_SECONDS = 3300
+MIN_HEADROOM_SECONDS = 300
+
+# Ceiling on the sub-page crawl for a single candidate. Without this, one
+# site with 15 slow/unresponsive sub-pages could burn 7+ minutes on its own
+# and blow past the deadline no matter how the headroom is calculated.
+MAX_SECONDS_PER_CANDIDATE = 240
 
 # --- EMAIL/CONTACT RESOLUTION HEURISTICS ---
 def resolve_primary_contacts(emails, phones, addresses, candidate_name, website_url=""):
@@ -135,7 +155,10 @@ def get_internal_links(html, base_url):
             path = parsed.path.lower()
             if any(path.endswith(ext) for ext in BLOCKED_EXTENSIONS): 
                 continue
-            if set(path.strip("/").split("/")) & BLOCKED_PATH_KEYWORDS: 
+            segments = set(path.strip("/").split("/"))
+            if segments & BLOCKED_PATH_KEYWORDS: 
+                continue
+            if any(YEAR_SEGMENT_RE.match(seg) for seg in segments):
                 continue
             links.add(parsed._replace(query="", fragment="").geturl())
             
@@ -376,13 +399,16 @@ async def async_harvest_pipeline(
         log_func(f"✅ Roster compiled. Found {len(harvested_roster)} targeted candidates.")
 
         # Deep Extraction Loop
+        worst_candidate_seconds = MIN_HEADROOM_SECONDS
         for count, cand in enumerate(harvested_roster, start=1):
             elapsed = time.monotonic() - pipeline_start
-            if elapsed > TIME_BUDGET_SECONDS:
+            time_left = HARD_DEADLINE_SECONDS - elapsed
+            if time_left < worst_candidate_seconds:
                 log_func(
-                    f"\n⏱️ Time budget reached ({elapsed:.0f}s). Stopping gracefully with "
-                    f"{len(harvested_roster) - count + 1} candidate(s) remaining. "
-                    f"Click Start Harvest again to resume the rest of this batch."
+                    f"\n⏱️ Stopping gracefully at {elapsed:.0f}s: {time_left:.0f}s left is not enough "
+                    f"for another candidate (slowest so far took {worst_candidate_seconds:.0f}s). "
+                    f"{len(harvested_roster) - count + 1} candidate(s) remaining -- "
+                    f"click Start Harvest again to resume."
                 )
                 break
 
@@ -390,6 +416,7 @@ async def async_harvest_pipeline(
                 log_func(f"\n[{count}/{len(harvested_roster)}] ⏭️ Skipping (already saved): {cand['name']}")
                 continue
 
+            candidate_start = time.monotonic()
             log_func(f"\n[{count}/{len(harvested_roster)}] Processing Profile: {cand['name']}")
             
             bp_html, _ = await fetch_page_html(page, cand['bp_url'], log_func)
@@ -441,25 +468,51 @@ async def async_harvest_pipeline(
 
                     if not is_gov_site:
                         internal_links = sorted(get_internal_links(site_html, active_url))
-                        if len(internal_links) > MAX_SUBPAGES_PER_SITE:
-                            log_func(f"    -> Found {len(internal_links)} sub-links. Capping at {MAX_SUBPAGES_PER_SITE} to control memory/time.")
-                            internal_links = internal_links[:MAX_SUBPAGES_PER_SITE]
-                        else:
-                            log_func(f"    -> Found {len(internal_links)} sub-links. Scraping all...")
+                        log_func(f"    -> Found {len(internal_links)} sub-links. Scraping all...")
 
+                        collected_chars = len(home_text)
+                        text_budget_hit = False
                         for sub_link in internal_links:
+                            candidate_elapsed = time.monotonic() - candidate_start
+                            if candidate_elapsed > MAX_SECONDS_PER_CANDIDATE:
+                                log_func(
+                                    f"    ⏱️ Candidate time ceiling hit ({candidate_elapsed:.0f}s). "
+                                    f"Moving on with {len(site_pages)} page(s) collected."
+                                )
+                                break
                             sub_html, final_sub_url = await fetch_page_html(page, sub_link, log_func)
                             final_domain = urlparse(final_sub_url).netloc
                             if any(blocked in final_domain for blocked in BLOCKED_DOMAINS):
                                 continue
                             if sub_html:
                                 sub_text = clean_text(sub_html)
-                                site_pages.append({"url": final_sub_url, "text": sub_text})
 
+                                # Always mine contacts, even past the text
+                                # budget -- an email or phone number on a deep
+                                # page is cheap to keep and often the most
+                                # valuable thing there.
                                 parsed_sub = extract_contact_details(sub_text, html_content=sub_html)
                                 running_emails.update(parsed_sub["emails"])
                                 running_phones.update(parsed_sub["phones"])
                                 running_addresses.update(parsed_sub["addresses"])
+
+                                # Only retain page text while there's room in
+                                # the Gemini payload.
+                                if collected_chars + len(sub_text) <= MAX_TOTAL_TEXT_CHARS:
+                                    site_pages.append({"url": final_sub_url, "text": sub_text})
+                                    collected_chars += len(sub_text)
+                                elif not text_budget_hit:
+                                    text_budget_hit = True
+                                    warning = (
+                                        f"Text budget of {MAX_TOTAL_TEXT_CHARS:,} chars reached after "
+                                        f"{len(site_pages)} page(s). A normal campaign site is well under "
+                                        f"this, so the crawl likely picked up listing/archive pages. "
+                                        f"Remaining pages were still mined for contacts, but their text "
+                                        f"was not sent to the AI. Worth checking this candidate's site "
+                                        f"structure."
+                                    )
+                                    candidate_record["metadata"].setdefault("crawl_warnings", []).append(warning)
+                                    log_func(f"    ⚠️ {warning}")
 
                             await page.wait_for_timeout(500)
 
@@ -479,6 +532,14 @@ async def async_harvest_pipeline(
             if on_candidate_scraped:
                 on_candidate_scraped(candidate_record)
             processed_count += 1
+
+            # Measure the FULL iteration -- scrape plus the callback's Gemini
+            # call and DB write -- since that's what the next iteration needs
+            # to reserve room for.
+            candidate_duration = time.monotonic() - candidate_start
+            if candidate_duration > worst_candidate_seconds:
+                worst_candidate_seconds = candidate_duration
+                log_func(f"    ⏱️ New slowest candidate: {candidate_duration:.0f}s (reserve updated)")
             # candidate_record (and its full site text) falls out of scope
             # here and can be garbage collected, instead of living on in a
             # growing batch list for the rest of the run.
