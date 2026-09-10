@@ -68,6 +68,19 @@ def render():
             state_cand = o_col2.checkbox("State", value=True)
             local_cand = o_col3.checkbox("Local", value=True)
 
+            st.write("**Re-scrape Behavior**")
+            force_rescrape = st.checkbox(
+                "Re-scrape candidates already saved",
+                value=False,
+                help=(
+                    "Off (default): candidates already saved with good data are skipped, so you can "
+                    "click Start Harvest again to resume a batch that ran out of time. Candidates that "
+                    "previously failed or came back empty are always retried either way.\n\n"
+                    "On: re-scrapes everyone from scratch to refresh their data. Existing QA status "
+                    "and auditor notes are preserved."
+                )
+            )
+
         submitted = st.form_submit_button("Start Harvest", type="primary", use_container_width=True)
 
     if submitted:
@@ -106,24 +119,37 @@ def render():
 
         supabase = init_connection()
 
-        # --- RESUME SUPPORT ---
-        # Pull every (name, office) already saved for this state/year in one
-        # query, so a second "Start Harvest" click can skip candidates that
-        # were already scraped+saved in a prior run that got cut off, instead
-        # of re-scraping the whole state from the top. Also lets us keep
-        # carrying forward each candidate's QA status/notes as before.
-        existing_rows = supabase.table("candidates").select("name, office, qa_status, qa_notes")\
+        # --- RESUME / RE-SCRAPE SUPPORT ---
+        # Pull everything already saved for this state/year in one query so we
+        # can decide per candidate whether to skip. A candidate is only skipped
+        # if it was saved with genuinely usable content -- records that failed
+        # categorization (structured_content contains "ERROR") or came back
+        # empty are always retried, so a bad run doesn't strand them forever.
+        existing_rows = supabase.table("candidates")\
+            .select("name, office, qa_status, qa_notes, structured_content")\
             .eq("state", state)\
             .eq("election_year", int(year)).execute()
 
-        existing_lookup = {
-            (row["name"], row["office"]): row
-            for row in (existing_rows.data or [])
-        }
+        existing_lookup = {}
+        for row in (existing_rows.data or []):
+            sc = row.get("structured_content") or {}
+            existing_lookup[(row["name"], row["office"])] = {
+                "qa_status": row.get("qa_status", "Pending"),
+                "qa_notes": row.get("qa_notes", ""),
+                # Store only the verdict, not the content itself -- the full
+                # verbatim text for a whole state would be a lot to hold onto
+                # for the entire run when all we need is a boolean.
+                "has_usable_content": isinstance(sc, dict) and bool(sc) and "ERROR" not in sc,
+            }
 
         def is_already_processed(cand):
-            return (cand['name'], cand['office']) in existing_lookup
-        # -----------------------
+            if force_rescrape:
+                return False
+            row = existing_lookup.get((cand['name'], cand['office']))
+            if not row:
+                return False
+            return row["has_usable_content"]
+        # -----------------------------------
 
         # Define a custom logging function that updates both the UI and the persistent state
         def ui_logger(msg):
@@ -153,7 +179,10 @@ def render():
             )
 
             # --- PRESERVE QA STATE ---
-            # Reuse the upfront lookup instead of an extra per-candidate query
+            # This fires whenever a candidate reaches the callback despite
+            # already having a row: either a previously failed/empty record
+            # being retried, or a force re-scrape. In both cases we must carry
+            # forward the auditor's existing work rather than reset it.
             existing = existing_lookup.get((record['metadata']['name'], record['metadata']['office']))
             qa_status = existing.get("qa_status", "Pending") if existing else "Pending"
             qa_notes = existing.get("qa_notes", "") if existing else ""
@@ -178,7 +207,19 @@ def render():
                 ui_logger(f"    ❌ Database error for {record['metadata']['name']}: {e}")
 
         with st.status(f"Executing Scraper Pipeline for {state}...", expanded=True) as status:
-            st.write("🤖 Scraping, categorizing with Gemini, and saving each candidate as it completes...")
+            # Surface what this run will actually do -- otherwise a run that
+            # legitimately skips most of the roster just looks broken.
+            saved_ok = sum(1 for r in existing_lookup.values() if r["has_usable_content"])
+            needs_retry = len(existing_lookup) - saved_ok
+
+            if force_rescrape:
+                ui_logger(f"🔁 Force re-scrape ON: re-processing all matching candidates. "
+                          f"({len(existing_lookup)} already in DB; QA status/notes will be preserved.)")
+            else:
+                ui_logger(f"↩️ Resume mode: skipping {saved_ok} candidate(s) already saved with good data. "
+                          f"{needs_retry} previously failed/empty record(s) will be retried.")
+
+            ui_logger("🤖 Scraping, categorizing with Gemini, and saving each candidate as it completes...")
             run_scraper(
                 state=state, 
                 year=year, 
@@ -191,7 +232,14 @@ def render():
 
             status.update(label=f"✅ Pipeline Complete! Saved {success_count} candidates this run.", state="complete", expanded=False)
             
-        st.success("Data successfully pushed to Supabase! Switch to the QA Dashboard to review.")
+        if success_count:
+            st.success(f"Saved {success_count} candidate(s) to Supabase! Switch to the QA Dashboard to review.")
+        else:
+            st.info(
+                "No new candidates were saved. Everything matching your filters is already in the "
+                "database with good data. Tick **Re-scrape candidates already saved** if you want to "
+                "refresh their data."
+            )
 
     # Always render the log container below the form if logs exist
     if st.session_state.crawler_logs:
