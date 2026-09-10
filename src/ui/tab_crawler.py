@@ -1,4 +1,28 @@
+import sys
+import time
+from collections import deque
+
 import streamlit as st
+
+# --- LOGGING CONFIGURATION ---
+# Issues and notices are kept in full (they're rare and they're the reason
+# anyone reads the logs). Routine progress lines are kept in a rolling
+# window so a 50-minute run can't grow session state without bound.
+MAX_RECENT_LOGS = 300
+
+# Only this many lines are rendered live during the run. The live view is a
+# fixed-size tail written into a placeholder rather than an ever-growing list
+# of elements, so DOM size stays constant no matter how long the run goes.
+LIVE_TAIL_LINES = 15
+
+# Lines carrying these markers are treated as issues/notices worth keeping.
+# Matching on the markers already used throughout scraper.py means none of
+# its existing log_func() calls need to change.
+ISSUE_MARKERS = ("❌", "⚠️", "⏱️")
+
+# Only genuine problems get mirrored to stderr (which Cloud Run records at
+# ERROR severity). Timing notices stay in-app so the ERROR filter stays useful.
+STDERR_MARKERS = ("❌", "⚠️")
 
 # A helper list of all 50 states
 US_STATES = [
@@ -16,8 +40,11 @@ US_STATES = [
 
 def render():
     # Initialize the log array in session state so it persists across reruns
-    if "crawler_logs" not in st.session_state:
-        st.session_state.crawler_logs = []
+    # Initialize the two log tiers so they persist across reruns
+    if "crawler_issues" not in st.session_state:
+        st.session_state.crawler_issues = []
+    if "crawler_recent" not in st.session_state:
+        st.session_state.crawler_recent = deque(maxlen=MAX_RECENT_LOGS)
 
     st.header("🚀 Candidate Data Crawler")
     st.markdown("Configure the parameters below to initiate the unified data harvest.")
@@ -94,7 +121,8 @@ def render():
             return
             
         # Clear the logs for a fresh run
-        st.session_state.crawler_logs = []
+        st.session_state.crawler_issues = []
+        st.session_state.crawler_recent = deque(maxlen=MAX_RECENT_LOGS)
 
         from src.core.scraper import run_scraper
         from src.core.ai_agent import categorize_candidate
@@ -151,10 +179,41 @@ def render():
             return row["has_usable_content"]
         # -----------------------------------
 
-        # Define a custom logging function that updates both the UI and the persistent state
-        def ui_logger(msg):
-            st.session_state.crawler_logs.append(msg)
-            st.write(msg) # Outputs inside the status container during the run
+        # The live tail placeholder is created inside the status container
+        # below; the holder lets ui_logger reference it before it exists.
+        _tail = {"box": None, "last_render": 0.0}
+
+        def _render_tail(force=False):
+            """Redraw the fixed-size tail in place. Throttled, because a
+            websocket update per log line over 50 minutes is a lot of chatter
+            for no benefit -- but never skipped for issues."""
+            box = _tail["box"]
+            if box is None:
+                return
+            now = time.monotonic()
+            if not force and now - _tail["last_render"] < 0.3:
+                return
+            _tail["last_render"] = now
+            tail = list(st.session_state.crawler_recent)[-LIVE_TAIL_LINES:]
+            box.code("\n".join(tail) or " ", language=None)
+
+        def ui_logger(msg, level=None):
+            """Record a log line and update the live view.
+
+            Issues/notices are retained in full and mirrored to stderr;
+            routine lines roll off after MAX_RECENT_LOGS.
+            """
+            is_issue = level == "issue" or any(m in msg for m in ISSUE_MARKERS)
+
+            st.session_state.crawler_recent.append(msg)
+            if is_issue:
+                st.session_state.crawler_issues.append(msg)
+                if level == "issue" or any(m in msg for m in STDERR_MARKERS):
+                    # Durable copy: session state dies with the tab, Cloud Run
+                    # logs don't.
+                    print(msg.strip(), file=sys.stderr, flush=True)
+
+            _render_tail(force=is_issue)
 
         # Tracks successful saves across the run. A plain int can't be
         # rebound from inside the nested callback below without `nonlocal`.
@@ -207,6 +266,10 @@ def render():
                 ui_logger(f"    ❌ Database error for {record['metadata']['name']}: {e}")
 
         with st.status(f"Executing Scraper Pipeline for {state}...", expanded=True) as status:
+            # Fixed-size live view. Everything during the run is written into
+            # this one placeholder rather than appended as new elements.
+            _tail["box"] = st.empty()
+
             # Surface what this run will actually do -- otherwise a run that
             # legitimately skips most of the roster just looks broken.
             saved_ok = sum(1 for r in existing_lookup.values() if r["has_usable_content"])
@@ -214,10 +277,12 @@ def render():
 
             if force_rescrape:
                 ui_logger(f"🔁 Force re-scrape ON: re-processing all matching candidates. "
-                          f"({len(existing_lookup)} already in DB; QA status/notes will be preserved.)")
+                          f"({len(existing_lookup)} already in DB; QA status/notes will be preserved.)",
+                          level="issue")
             else:
                 ui_logger(f"↩️ Resume mode: skipping {saved_ok} candidate(s) already saved with good data. "
-                          f"{needs_retry} previously failed/empty record(s) will be retried.")
+                          f"{needs_retry} previously failed/empty record(s) will be retried.",
+                          level="issue")
 
             ui_logger("🤖 Scraping, categorizing with Gemini, and saving each candidate as it completes...")
             run_scraper(
@@ -230,6 +295,8 @@ def render():
                 is_already_processed=is_already_processed,
             )
 
+            # Final flush -- the throttle may have skipped the last few lines.
+            _render_tail(force=True)
             status.update(label=f"✅ Pipeline Complete! Saved {success_count} candidates this run.", state="complete", expanded=False)
             
         if success_count:
@@ -241,10 +308,29 @@ def render():
                 "refresh their data."
             )
 
-    # Always render the log container below the form if logs exist
-    if st.session_state.crawler_logs:
+    # --- POST-RUN LOG DISPLAY ---
+    issues = st.session_state.crawler_issues
+    recent = st.session_state.crawler_recent
+
+    if issues:
         st.divider()
-        st.subheader("📋 Execution Logs")
-        with st.container(height=400): # Creates a scrollable container 400px high
-            for log_msg in st.session_state.crawler_logs:
-                st.text(log_msg)
+        st.subheader(f"⚠️ Issues & Notices ({len(issues)})")
+        st.caption(
+            "Errors, warnings, and anything explaining why the run behaved unexpectedly. "
+            "Kept in full. Errors and warnings are also written to the Cloud Run logs, "
+            "which outlive this browser session."
+        )
+        with st.container(height=min(400, 60 + 28 * len(issues))):
+            for msg in issues:
+                st.text(msg)
+
+    if recent:
+        st.divider()
+        with st.expander(f"📋 Recent Activity (last {len(recent)} lines)", expanded=not issues):
+            st.caption(
+                f"Rolling window of the most recent {MAX_RECENT_LOGS} lines. Older routine "
+                f"progress lines are discarded during long runs."
+            )
+            with st.container(height=400): # Creates a scrollable container 400px high
+                for log_msg in recent:
+                    st.text(log_msg)
