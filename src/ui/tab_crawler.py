@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 from collections import deque
@@ -19,6 +20,17 @@ LIVE_TAIL_LINES = 15
 # Matching on the markers already used throughout scraper.py means none of
 # its existing log_func() calls need to change.
 ISSUE_MARKERS = ("❌", "⚠️", "⏱️")
+
+# scraper.py announces each candidate before working on it. Sniffing that line
+# lets issues be tagged with who they happened to, without threading a context
+# argument through every log_func() call in the scraper.
+CANDIDATE_LINE_RE = re.compile(r"\[(\d+)/(\d+)\]\s*Processing Profile:\s*(.+?)\s*$")
+
+# Log lines written during work on a specific candidate are indented; run-level
+# lines (roster failures, the time-budget stop, the run-mode summary) start at
+# column zero. That convention is used to decide which issues get tagged with a
+# candidate -- attaching one to a run-level message would be actively wrong,
+# since it would blame the last candidate processed for something unrelated.
 
 # Only genuine problems get mirrored to stderr (which Cloud Run records at
 # ERROR severity). Timing notices stay in-app so the ERROR filter stays useful.
@@ -182,6 +194,7 @@ def render():
         # The live tail placeholder is created inside the status container
         # below; the holder lets ui_logger reference it before it exists.
         _tail = {"box": None, "last_render": 0.0}
+        _context = {"candidate": None}
 
         def _render_tail(force=False):
             """Redraw the fixed-size tail in place. Throttled, because a
@@ -203,15 +216,31 @@ def render():
             Issues/notices are retained in full and mirrored to stderr;
             routine lines roll off after MAX_RECENT_LOGS.
             """
+            # Track who we're working on, so issues can name them.
+            match = CANDIDATE_LINE_RE.search(msg)
+            if match:
+                idx, total, name = match.groups()
+                _context["candidate"] = f"{idx}/{total} {name}"
+
             is_issue = level == "issue" or any(m in msg for m in ISSUE_MARKERS)
 
             st.session_state.crawler_recent.append(msg)
             if is_issue:
-                st.session_state.crawler_issues.append(msg)
+                # Indented => happened while working on a candidate. Tag it so
+                # the Issues list stands alone without cross-referencing the
+                # activity log. Skip the tag if the message already names them.
+                body = msg.lstrip("\n")
+                candidate = _context["candidate"]
+                if candidate and body[:1].isspace() and candidate.split(" ", 1)[-1] not in msg:
+                    entry = f"[{candidate}] {msg.strip()}"
+                else:
+                    entry = msg.strip()
+
+                st.session_state.crawler_issues.append(entry)
                 if level == "issue" or any(m in msg for m in STDERR_MARKERS):
                     # Durable copy: session state dies with the tab, Cloud Run
                     # logs don't.
-                    print(msg.strip(), file=sys.stderr, flush=True)
+                    print(entry, file=sys.stderr, flush=True)
 
             _render_tail(force=is_issue)
 
